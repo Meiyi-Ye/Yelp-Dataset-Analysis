@@ -1,0 +1,289 @@
+---
+title: "Stats 140 Yelp Final Project"
+author: "Caitlin Ree"
+date: "2024-02-21"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(jsonlite)
+library(readr)
+library(tidyverse)
+library(DT)
+library(lubridate)
+library(ggthemes)
+library(RColorBrewer)
+library(tidytext)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(tm)
+library(wordcloud)
+library(janeaustenr)
+library(caTools)
+library(randomForest)
+library(pROC)
+library(sf)
+library(mapview)
+library(papeR)
+```
+
+# EDA
+
+## Step 1
+
+```{r warning=FALSE}
+yelp_dataset <- read.csv("yelp_combined_cleaned_chinese.csv")
+
+# Rows/records and columns/fields
+dim(yelp_dataset)
+# Records: 16014
+# Fields: 16
+
+# Data types present
+glimpse(yelp_dataset)
+
+# Unique values per field
+sapply(yelp_dataset, function(x) length(unique(x)))
+
+# Missingness
+yelp_dataset %>% summarise_all(funs(sum(is.na(.))))
+```
+
+## Step 2
+
+1. What types of methods could be used to identify the typical or most common data values for
+the features (variables) of greatest interest in your data?
+
+```{r}
+summary(yelp_dataset)
+```
+
+2. What types of methods could be used to document variability in these features?
+
+We could see the distribution of each of the features by modeling a histogram, through this, we can see the variability in these features.
+
+3. How might we identify the distribution of a specific feature, e.g., how do we determine if it is
+normally distributed?
+
+We can plot a histogram and see if it has a bell-shaped curve.
+
+4. How might determine if two (or more) features are related?
+
+We can find their correlation coefficient. 
+
+5. How might we determine the extent of outliers in a given feature?
+
+We can visually see this by plotting a boxplot. 
+
+## Opinion Lexicon
+
+```{r, warning=F}
+# Get rid of line breaks
+yelp_dataset$text <- gsub("<br /><br />", " ", yelp_dataset$text)
+
+# Load in opinion lexicon
+# Bing Liu lexicon (Kaggle)
+setwd("/Users/caitlinree/Desktop/Stats 140/opinion_lexicon")
+neg_lexicon <- read.table("negative-words.txt", sep = "\t")
+neg_lexicon <- neg_lexicon[-(1:33), ]
+neg_lexicon <- cbind(neg_lexicon, rep("negative", length(neg_lexicon)))
+pos_lexicon <- read.table("positive-words.txt", sep = "\t")
+pos_lexicon <- pos_lexicon[-(1:33), ]
+pos_lexicon <- cbind(pos_lexicon, rep("positive", length(pos_lexicon)))
+
+opinion_lexicon <- rbind(neg_lexicon, pos_lexicon)
+colnames(opinion_lexicon) <- c("word", "sentiment")
+opinion_lexicon <- data.frame(opinion_lexicon)
+```
+
+```{r, warning=F}
+# Number of rows
+yelp_nrow <- nrow(yelp_dataset)
+# Add number of rows to df
+yelp_df <- data.frame(yelp_dataset) %>%
+  mutate(review_num = row_number())
+yelp_df <- yelp_df[, c("review_num", "text")]
+
+# Split into separate words for every review
+yelp_by_word <- yelp_df %>%
+  unnest_tokens(word, text)
+head(yelp_by_word)
+
+# Number of words per review
+words_per_review <- yelp_by_word %>%
+  group_by(review_num) %>%
+  summarize(word_count = n())
+head(words_per_review)
+
+# Words in both reviews and lexicon
+yelp_by_lexicon <- yelp_by_word[c(1, 2)] %>%
+  right_join(opinion_lexicon[1], by = c("word" = "word"))
+
+head(yelp_by_lexicon)
+```
+
+```{r}
+# Term Frequency
+word_tf <- yelp_by_lexicon %>%
+  count(word)
+```
+
+## Visualizations
+
+```{r}
+# Sentiment of words
+word_tf_sentiment <- word_tf %>%
+  right_join(opinion_lexicon, by=c("word"="word"))
+
+# Order words by frequency
+ordered_data <- word_tf_sentiment[order(word_tf_sentiment$n, decreasing=T),]
+
+# Fixing fried sentiment
+ordered_data[4, 3] <- "positive"
+
+# Chart of top 20 most frequent words
+ggplot(ordered_data[1:20,], aes(reorder(word,n), n)) +
+  ggtitle("Top 20 Words in the Reviews")+
+  geom_bar(stat = "identity", fill = "steelblue", alpha = 0.6, width = 0.7) +
+  scale_y_continuous() +
+  geom_text(aes(label = n), hjust = 1, vjust = 0.5, color = "white", size = 3) +
+  coord_flip()+
+  ylab("Frequency")+
+  xlab("Words")+
+  theme_bw()
+
+# Word cloud of most frequent words
+wordcloud(words = ordered_data$word, freq = ordered_data$n, min.freq = 100, scale = c(3,.5), max.words = 50, 
+          random.order = FALSE, colors = brewer.pal(8, "Dark2"))
+```
+
+```{r}
+# Number of positive words used
+positive_n <- sum(with(ordered_data,n[sentiment=="positive"]))
+# Number of positive words used
+negative_n <- sum(with(ordered_data,n[sentiment=="negative"]))
+
+# Chart of positive vs. negative words
+plot_df <- data.frame(sentiment=c("positive","negative"), n=c(positive_n, negative_n))
+
+ggplot(plot_df, aes(x=sentiment, y=n)) +
+  geom_bar(stat="identity", fill="firebrick")
+```
+
+# Sentiment of Review
+
+```{r}
+# Add sentiment to dataset
+review_word_sentiment <- left_join(yelp_by_lexicon, word_tf_sentiment, by="word")
+review_word_sentiment <- review_word_sentiment[,-3]
+
+# Find sentiment of each review
+attach(review_word_sentiment)
+review_sentiment <- data.frame("review"=1:16014,"sentiment"=rep(NA,16014))
+for(i in 1:16014) {
+  total <- 0
+  words <- review_word_sentiment[review_num==i,]
+  words <- na.omit(words)
+  for(j in 1:nrow(words)) {
+    ifelse(words[j,3]=="positive",total<-total+1,total<-total-1)
+  }
+  average <- total / nrow(words)
+  ifelse(average>0,review_sentiment[i,2]<-"positive",review_sentiment[i,2]<-"negative")
+}
+
+# New dataset
+yelp_dataset[,17] <- 1:16014
+names(yelp_dataset)[names(yelp_dataset) == "V17"] <- "review"
+yelp_dataset_sentiment <- full_join(yelp_dataset, review_sentiment, by="review")
+yelp_dataset_sentiment <- yelp_dataset_sentiment[,-17]
+
+# write.csv(yelp_dataset_sentiment, file="/Users/caitlinree/Desktop/Stats 140/yelp_dataset_sentiment.csv")
+```
+
+# Overall Sentiment per Business
+
+```{r}
+# Find sentiment count per business
+business_sentiment <- yelp_dataset_sentiment %>% 
+  group_by(business_id, sentiment) %>%
+  tally() %>%
+  pivot_wider(names_from=sentiment, values_from=n) %>%
+  mutate(across(everything(), .fns=~replace_na(.,0)))
+
+# Assign business sentiment based on majority
+business_sentiment$business_sentiment <- with(business_sentiment, ifelse(positive > negative, "positive", "negative"))
+business_sentiment <- business_sentiment[,-c(2:4)]
+
+# Add business sentiment to dataset
+yelp_dataset_final <- full_join(yelp_dataset_sentiment, business_sentiment, by="business_id")
+```
+
+```{r}
+# This function creates an interactive map where you can see the reviews/information, but unfortunately it doesn't embed to PDF
+# mapview(yelp_dataset_final[yelp_dataset_final$business_sentiment == "positive",], xcol="longitude", ycol="latitude", col.regions="blue", crs=4269, grid=F, layer.name="Positive") + mapview(yelp_dataset_final[yelp_dataset_final$business_sentiment == "negative",], xcol="longitude", ycol="latitude", col.regions="red", crs=4269, grid=F, layer.name="Negative")
+# We can see that the cities included in the dataset are Edmonton, Santa Barbara, Tucson, Reno, Boise, New Orleans, St. Louis, Indianapolis, Nashville, Tampa Bay, and Philadelphia
+```
+
+# Comparison of Businesses' Stars and Sentiment Percentage
+
+```{r}
+# Find sentiment count per business
+business_sentiment <- yelp_dataset_sentiment %>% 
+  group_by(business_id, sentiment) %>%
+  tally() %>%
+  pivot_wider(names_from=sentiment, values_from=n) %>%
+  mutate(across(everything(), .fns=~replace_na(.,0)))
+
+# Assign business sentiment percentage of positive reviews
+business_sentiment$sentiment_percentage <- with(business_sentiment, positive / (negative + positive))
+business_sentiment <- business_sentiment[,-c(2:4)]
+
+# Add business sentiment to dataset
+yelp_dataset_final_perc <- full_join(yelp_dataset_final, business_sentiment, by="business_id")
+
+# Comparison
+comparison_lm <- lm(stars_business ~ business_sentiment+sentiment_percentage, data=yelp_dataset_final_perc)
+summary(comparison_lm)
+prettify(summary(comparison_lm))
+```
+
+# Codebook of Sorts
+stars_review: Stars given by user for that particular review.  
+average_stars: Average stars given by that user.  
+stars_business: Average stars for that business.  
+review_count: Number of reviews for that business.  
+sentiment: Sentiment for that particular review.  
+business_sentiment: Majority sentiment for that business.  
+sentiment_percentage: Percentage of positive review sentiments (where 1 is positive and 0 is negative)
+
+# Model Selection for Linear Regression
+
+```{r, warning=F}
+yelp_dataset_lm <- lm(stars_business ~ stars_review+average_stars+state+review_count+sentiment+business_sentiment+sentiment_percentage, data=yelp_dataset_final_perc)
+selection_lm <- step(yelp_dataset_lm)
+# Forward selection suggests removing average_stars
+prettify(summary(selection_lm))
+```
+
+# Multicollinearity
+
+```{r}
+car::vif(selection_lm)
+# No multicollinearity found
+```
+
+# Logistic Regression
+
+```{r, warning=F}
+# "binary" is 1 for positive overall sentiment, 0 for negative overall sentiment
+yelp_dataset_final_perc$binary <- ifelse(yelp_dataset_final_perc$business_sentiment=="positive",1,0)
+yelp_dataset_log <- glm(binary ~ stars_review+average_stars+state+review_count+sentiment, data=yelp_dataset_final_perc, family="binomial")
+selection_log <- step(yelp_dataset_log)
+# Forward selection suggests keeping all variables (except sentiment_percentage, which was already removed due to insignificance issues)
+prettify(summary(yelp_dataset_log))
+car::vif(yelp_dataset_log)
+# No multicollinearity found
+```
